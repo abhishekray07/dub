@@ -30,6 +30,8 @@ module.exports = withPlausibleProxy({
     "shiki",
     "@dub/prisma",
     "@dub/email",
+    "@dub/utils",
+    "@dub/ui",
     "@boxyhq/saml-jackson",
   ],
   outputFileTracingIncludes: {
