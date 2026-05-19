@@ -39,6 +39,12 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
   logger.info(...transformMiddlewareRequest(req));
   ev.waitUntil(logger.flush());
 
+  // Vercel preview URLs (dub-web-*.vercel.app) have no subdomain, so route
+  // them straight to the app dashboard. Lets PR previews work for e2e tests.
+  if (domain.endsWith(".vercel.app")) {
+    return AppMiddleware(req);
+  }
+
   // for App
   if (APP_HOSTNAMES.has(domain)) {
     return AppMiddleware(req);
