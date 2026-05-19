@@ -32,6 +32,12 @@ import { trackDubLead } from "./track-dub-lead";
 
 const VERCEL_DEPLOYMENT = !!process.env.VERCEL_URL;
 
+// Base URL for NextAuth/SAML callbacks. NEXTAUTH_URL wins when set; otherwise
+// fall back to Vercel's auto-injected VERCEL_URL so per-PR preview deploys work.
+const NEXTAUTH_BASE_URL =
+  process.env.NEXTAUTH_URL ||
+  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+
 const CustomPrismaAdapter = (p: PrismaClient) => {
   return {
     ...PrismaAdapter(p),
@@ -101,7 +107,7 @@ export const authOptions: NextAuthOptions = {
       version: "2.0",
       checks: ["pkce", "state"],
       authorization: {
-        url: `${process.env.NEXTAUTH_URL}/api/auth/saml/authorize`,
+        url: `${NEXTAUTH_BASE_URL}/api/auth/saml/authorize`,
         params: {
           scope: "",
           response_type: "code",
@@ -109,10 +115,10 @@ export const authOptions: NextAuthOptions = {
         },
       },
       token: {
-        url: `${process.env.NEXTAUTH_URL}/api/auth/saml/token`,
+        url: `${NEXTAUTH_BASE_URL}/api/auth/saml/token`,
         params: { grant_type: "authorization_code" },
       },
-      userinfo: `${process.env.NEXTAUTH_URL}/api/auth/saml/userinfo`,
+      userinfo: `${NEXTAUTH_BASE_URL}/api/auth/saml/userinfo`,
       profile: async (profile) => {
         let existingUser = await prisma.user.findUnique({
           where: { email: profile.email },
@@ -172,7 +178,7 @@ export const authOptions: NextAuthOptions = {
         const { access_token } = await oauthController.token({
           code,
           grant_type: "authorization_code",
-          redirect_uri: process.env.NEXTAUTH_URL as string,
+          redirect_uri: NEXTAUTH_BASE_URL,
           client_id: "dummy",
           client_secret: process.env.NEXTAUTH_SECRET as string,
         });
