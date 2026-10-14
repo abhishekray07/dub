@@ -49,6 +49,24 @@ export async function chargeSucceeded(event: Stripe.ChargeSucceededEvent) {
   }
 
   if (invoice.status === "completed") {
+    // The invoice is marked completed before the payouts job is queued, so if queueing
+    // failed, this redelivery is the only chance left to queue it.
+    if (invoice.type === "partnerPayout") {
+      const processingPayouts = await prisma.payout.count({
+        where: {
+          invoiceId: invoice.id,
+          status: "processing",
+        },
+      });
+
+      if (processingPayouts > 0) {
+        console.log(
+          `Invoice ${invoice.id} already completed but ${processingPayouts} payouts are still processing, queueing them again...`,
+        );
+        return await processPayoutInvoice({ invoice });
+      }
+    }
+
     return `Invoice ${invoice.id} already completed, skipping...`;
   }
 
