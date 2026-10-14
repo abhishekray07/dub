@@ -16,12 +16,16 @@ import {
   log,
   pluralize,
 } from "@dub/utils";
-import { Prisma, WorkspaceEnvironment } from "@prisma/client";
+import { Payout, Prisma, Program, WorkspaceEnvironment } from "@prisma/client";
 import { waitUntil } from "@vercel/functions";
 import { PARTNER_IDS_TO_LOG_PAYOUTS_FOR } from "../constants/misc";
 import { enqueueBatchJobs } from "../cron/enqueue-batch-jobs";
 import { createPayoutsIdempotencyKey } from "../payouts/create-payouts-idempotency-key";
 import { markPayoutsAsProcessed } from "../payouts/mark-payouts-as-processed";
+import {
+  findTransferredPayouts,
+  payoutIdsToTransferMetadata,
+} from "../payouts/transferred-payouts";
 
 export const createStripeTransfer = async ({
   partnerId,
@@ -99,7 +103,7 @@ export const createStripeTransfer = async ({
     ],
   );
 
-  const allPayouts = [...previouslyProcessedPayouts, ...currentInvoicePayouts];
+  let allPayouts = [...previouslyProcessedPayouts, ...currentInvoicePayouts];
 
   // this should never happen but just in case
   if (allPayouts.length === 0) {
@@ -148,6 +152,65 @@ export const createStripeTransfer = async ({
     } else {
       console.warn(message);
       return;
+    }
+  }
+
+  // If a previous run created the transfer but stopped before marking its payouts as sent,
+  // those payouts are still "processed". The idempotency key only stops a second transfer
+  // within 24 hours and while the set of payouts is unchanged, so check Stripe first.
+  if (previouslyProcessedPayouts.length > 0) {
+    const transferredPayouts = await findTransferredPayouts({
+      stripeConnectId: partner.stripeConnectId,
+      payouts: allPayouts,
+    });
+
+    if (transferredPayouts.size > 0) {
+      const transfers = new Map<
+        string,
+        { created: number; payouts: typeof allPayouts }
+      >();
+      for (const payout of allPayouts) {
+        const transfer = transferredPayouts.get(payout.id);
+        if (!transfer) continue;
+        const entry = transfers.get(transfer.id) ?? {
+          created: transfer.created,
+          payouts: [],
+        };
+        entry.payouts.push(payout);
+        transfers.set(transfer.id, entry);
+      }
+
+      for (const [transferId, { created, payouts }] of transfers) {
+        const message = `Found existing transfer ${transferId} for partner ${partner.id} covering ${pluralize(
+          "payout",
+          payouts.length,
+        )} ${payouts.map((p) => p.id).join(", ")}, marking them as sent instead of transferring again`;
+        console.warn(message);
+        await log({ message, type: "alerts" });
+
+        await markPayoutsAsSent({
+          payouts,
+          transferId,
+          paidAt: new Date(created * 1000),
+        });
+      }
+
+      // leave the payouts that are already paid out of this transfer
+      for (const payouts of [
+        previouslyProcessedPayouts,
+        currentInvoicePayouts,
+      ]) {
+        payouts.splice(
+          0,
+          payouts.length,
+          ...payouts.filter((p) => !transferredPayouts.has(p.id)),
+        );
+      }
+      allPayouts = [...previouslyProcessedPayouts, ...currentInvoicePayouts];
+
+      if (allPayouts.length === 0) {
+        return;
+      }
     }
   }
 
@@ -220,6 +283,7 @@ export const createStripeTransfer = async ({
       transfer_group: finalPayoutInvoiceId!,
       destination: partner.stripeConnectId,
       description: `Dub Partners payout transfer (${allPayoutsProgramNames.join(", ")})`,
+      metadata: payoutIdsToTransferMetadata(allPayouts.map((p) => p.id)),
       // Omit `source_transaction` if prior processed payouts exist to ensure this transfer
       // never exceeds the original charge amount.
       ...(previouslyProcessedPayouts.length === 0 &&
@@ -249,7 +313,54 @@ export const createStripeTransfer = async ({
     );
   }
 
-  const payoutIds = allPayouts.map((p) => p.id);
+  await markPayoutsAsSent({
+    payouts: allPayouts,
+    transferId: transfer.id,
+    paidAt: new Date(),
+  });
+
+  if (partner.email && (forceWithdrawal || currentInvoicePayouts.length > 0)) {
+    const payout = currentInvoicePayouts[0];
+    const emailRes = await sendEmail({
+      variant: "notifications",
+      to: partner.email,
+      subject: forceWithdrawal
+        ? `A withdrawal of ${currencyFormatter(totalTransferableAmount)} has been initiated from your Dub account`
+        : `You've received a ${currencyFormatter(payout.amount)} payout from ${payout.program.name}`,
+      react: forceWithdrawal
+        ? PartnerPayoutForceWithdrawal({
+            email: partner.email,
+            payout: {
+              amount: totalTransferableAmount,
+              method: "connect",
+            },
+          })
+        : PartnerPayoutProcessed({
+            email: partner.email,
+            program: payout.program,
+            payout,
+          }),
+    });
+
+    console.log(`Resend email sent: ${JSON.stringify(emailRes, null, 2)}`);
+  }
+
+  return transfer;
+};
+
+// Mark the payouts as sent with the given transfer, and their commissions as paid
+async function markPayoutsAsSent({
+  payouts,
+  transferId,
+  paidAt,
+}: {
+  payouts: (Pick<Payout, "id"> & {
+    program: Pick<Program, "id" | "workspaceId">;
+  })[];
+  transferId: string;
+  paidAt: Date;
+}) {
+  const payoutIds = payouts.map((p) => p.id);
 
   const commissions = await prisma.commission.findMany({
     where: {
@@ -273,9 +384,9 @@ export const createStripeTransfer = async ({
       },
     },
     data: {
-      stripeTransferId: transfer.id,
+      stripeTransferId: transferId,
       status: "sent",
-      paidAt: new Date(),
+      paidAt,
       method: "connect",
     },
   });
@@ -315,7 +426,7 @@ export const createStripeTransfer = async ({
     Promise.allSettled([
       trackCommissionStatusUpdatesByProgram({
         commissions,
-        payouts: allPayouts,
+        payouts,
         newStatus: "paid",
       }),
 
@@ -330,32 +441,4 @@ export const createStripeTransfer = async ({
       ),
     ]),
   );
-
-  if (partner.email) {
-    const payout = currentInvoicePayouts[0];
-    const emailRes = await sendEmail({
-      variant: "notifications",
-      to: partner.email,
-      subject: forceWithdrawal
-        ? `A withdrawal of ${currencyFormatter(totalTransferableAmount)} has been initiated from your Dub account`
-        : `You've received a ${currencyFormatter(payout.amount)} payout from ${payout.program.name}`,
-      react: forceWithdrawal
-        ? PartnerPayoutForceWithdrawal({
-            email: partner.email,
-            payout: {
-              amount: totalTransferableAmount,
-              method: "connect",
-            },
-          })
-        : PartnerPayoutProcessed({
-            email: partner.email,
-            program: payout.program,
-            payout,
-          }),
-    });
-
-    console.log(`Resend email sent: ${JSON.stringify(emailRes, null, 2)}`);
-  }
-
-  return transfer;
-};
+}
